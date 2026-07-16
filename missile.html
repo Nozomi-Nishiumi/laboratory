@@ -140,16 +140,23 @@
   tryNextUrl();
 
   // ===== Environment Map Rendering (Optimized for Google Sites) =====
+  // 再利用バッファ: 毎フレーム canvas/ImageData(W*H*4≈数MB)を作り直すと
+  // GC負荷で徐々にカクつくため、初回とリサイズ時のみ確保して使い回す
+  let envRenderCanvas = null, envRenderCtx = null, envRenderData = null;
   function renderEnvironmentMapBackground() {
     if (!envMapImg || !envImageData) return false;
 
     try {
-      // Create temporary canvas for pixel-perfect rendering
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = W;
-      tempCanvas.height = H;
-      const tempCtx = tempCanvas.getContext('2d');
-      const imageData = tempCtx.createImageData(W, H);
+      if (!envRenderCanvas || envRenderCanvas.width !== W || envRenderCanvas.height !== H) {
+        envRenderCanvas = document.createElement('canvas');
+        envRenderCanvas.width = W;
+        envRenderCanvas.height = H;
+        envRenderCtx = envRenderCanvas.getContext('2d');
+        envRenderData = envRenderCtx.createImageData(W, H);
+      }
+      const tempCanvas = envRenderCanvas;
+      const tempCtx = envRenderCtx;
+      const imageData = envRenderData;
 
       // Use the same camera coordinate system as missile simulation
       const cy = Math.cos(cam.yaw);
@@ -607,15 +614,51 @@
   const FLARE = {
     enable: true,
     baseSize: 90,          // 少し大きく
-    ghostCount: 6,         // ゴーストを増やして目立たせる
-    ghostMin: 0.25,
-    ghostMax: 1.3,
     streakLen: 480,        // ストリークを長く
     streakThick: 20        // 厚くして見やすく
   };
+  // ゴースト定義(実写の逆光写真を参考に3個/光源):
+  //   近: 小さな淡い暖色の円盤 / 中: 緑がかった中型の円盤 /
+  //   遠: 最大の、縁だけ明るい中空の青いリング
+  // k: 光源→レンズ中心方向の位置(1=中心対称点を通過する係数)。
+  // size: グロー半径比。tint: コーティング由来の色(光源色と混合)。
+  const GHOSTS = [
+    { k: 0.45, size: 0.38, ring: false, tint: [255, 235, 215], a: 1.0 },
+    { k: 0.85, size: 0.75, ring: false, tint: [170, 235, 210], a: 0.8 },
+    { k: 1.45, size: 1.90, ring: true,  tint: [160, 215, 255], a: 0.6 },
+  ];
+
+  // 360度画像(equirect)を解析して得た太陽位置(画素980,513 / 2000x1000)。
+  // 実レンダリング上の太陽飽和核の重心からキャリブレーション済み。
+  // 雲中の輝点(1213,392)はノイズとして除外。
+  const SUN_UV = { u: 0.4901, v: 0.5132 };
+  const SUN_DIR = (() => {
+    const lon = SUN_UV.u * 2 * Math.PI - Math.PI;      // サンプラの逆変換
+    const lat = Math.PI * 0.5 - SUN_UV.v * Math.PI;
+    return { x: Math.sin(lon) * Math.cos(lat), y: Math.sin(lat), z: Math.cos(lon) * Math.cos(lat) };
+  })();
+  // 太陽方向をスクリーンへ投影。renderEnvironmentMapBackground と同一の
+  // カメラ基底・FOVを使うため、背景に描かれる太陽と厳密に一致する。
+  // 背面(dz<=0)なら null。
+  function projectSunDir(){
+    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const fX = sy*cp, fY = -sp,  fZ = cy*cp;   // 環境マップと同じ(pitch反転)基底
+    const rX = cy,    rY = 0,    rZ = -sy;
+    const uX = sy*sp, uY = cp,   uZ = cy*sp;
+    const dz = SUN_DIR.x*fX + SUN_DIR.y*fY + SUN_DIR.z*fZ;
+    if (dz <= 0.02) return null;
+    const dx = SUN_DIR.x*rX + SUN_DIR.y*rY + SUN_DIR.z*rZ;
+    const dy = SUN_DIR.x*uX + SUN_DIR.y*uY + SUN_DIR.z*uZ;
+    return { x: W*0.5 + FOV*dx/dz, y: H*0.5 - FOV*dy/dz };
+  }
 
   // baseRGB: 'r,g,b' format (e.g. '160,210,255')
-  function drawLensFlare(gc, x, y, intensity, t, baseRGB){
+  // ghostGain: ゴーストの不透明度倍率(既定1)。太陽=4(明るい空でも見える強さ)、
+  // ミサイル/ターゲット=0.35(すごく薄く)
+  // noHalo: 光源の周囲のハロー環を描かない(ミサイル/ターゲット用。
+  // ハローは太陽のような強い光源だけの演出とする)
+  function drawLensFlare(gc, x, y, intensity, t, baseRGB, ghostGain, noHalo){
     if(!FLARE.enable || intensity<=0) return;
     const prev = gc.globalCompositeOperation;
     gc.globalCompositeOperation = 'lighter';
@@ -626,7 +669,9 @@
 
     // Weaken when near off-screen
     const edgeAtten = Math.max(0, 1 - (dist / Math.hypot(cx, cy)));
-    const I = intensity * (0.45 + 0.15*Math.sin(t*4)) * edgeAtten;
+    // 明滅はゆっくり(周期約4秒)
+    const flick = 0.45 + 0.15*Math.sin(t*1.5);
+    const I = intensity * flick * edgeAtten;
 
     // Center glow (color tuning)
     const glowR = FLARE.baseSize * (0.6 + 0.9*I);
@@ -635,6 +680,39 @@
     g.addColorStop(0.35,`rgba(${baseRGB},${0.24*I})`);
     g.addColorStop(1.0, `rgba(${baseRGB},0)`);
     gc.fillStyle = g; gc.beginPath(); gc.arc(x,y, glowR, 0, Math.PI*2); gc.fill();
+
+    if (!noHalo) {
+      // 多層ハロー: レンズ内の多層反射による固定半径の同心円群。
+      // 円の輪郭(半径)は光量で動かさない。光源がレンズ中心に近づく=
+      // 入射光が増えるほど、外側の層まで映り込む(映る範囲だけが広がる)。
+      // th: その層が映り始める光量しきい値(光量 L=中心整列度)
+      const L = edgeAtten;
+      // 全体ゲイン: 整列度Lの3乗で指数的に立ち上がる。
+      // 太陽から外れている時はほぼ消え、正対で最大0.7(従来最大の7割)
+      const haloGain = 0.7 * Math.pow(L, 3);
+      const haloBase = FLARE.baseSize * 1.4; // 固定基準半径(明滅・光量に非依存)
+      const HALO_LAYERS = [
+        { r: 1.00, th: 0.00, a: 0.100 },
+        { r: 1.45, th: 0.30, a: 0.085 },
+        { r: 1.95, th: 0.55, a: 0.070 },
+        { r: 2.50, th: 0.75, a: 0.060 },
+      ];
+      for (let hi = 0; hi < HALO_LAYERS.length && haloGain > 0.002; hi++) {
+        const Ld = HALO_LAYERS[hi];
+        const vis = Math.max(0, Math.min(1, (L - Ld.th) / 0.12)); // 立ち上がり
+        if (vis <= 0) continue;
+        const hr = haloBase * Ld.r;
+        const ha = Ld.a * vis * intensity * flick * haloGain;
+        // 内側にも薄い明るみを持たせ、縁のピークも抑えて
+        // 縁と内側のコントラストを弱める
+        const hg = gc.createRadialGradient(x,y,0, x,y, hr);
+        hg.addColorStop(0.00, `rgba(${baseRGB},${0.22*ha})`);
+        hg.addColorStop(0.55, `rgba(${baseRGB},${0.30*ha})`);
+        hg.addColorStop(0.92, `rgba(${baseRGB},${0.75*ha})`);
+        hg.addColorStop(1.00, `rgba(${baseRGB},0)`);
+        gc.fillStyle = hg; gc.beginPath(); gc.arc(x,y, hr, 0, Math.PI*2); gc.fill();
+      }
+    }
 
     // Horizontal anamorphic streak (same color)
     const sLen = FLARE.streakLen * (0.5 + I);
@@ -649,17 +727,43 @@
     lg.addColorStop(1.00, `rgba(${baseRGB},0)`);
     gc.fillStyle = lg; gc.fillRect(sx0, sy0, sLen, sTh);
 
-    // Ghost (center inversion direction, same color)
-    for(let i=0;i<FLARE.ghostCount;i++){
-      const k = FLARE.ghostMin + (i/(FLARE.ghostCount-1))*(FLARE.ghostMax-FLARE.ghostMin);
-      const gx = cx - dx * k;
-      const gy = cy - dy * k;
-      const gSize = glowR * (0.25 + 0.55*(1-k));
-      const a = 0.22 * I * (1 - i/FLARE.ghostCount);
+    // Ghost (光源とレンズ中心を結ぶ直線上、中心を挟んだ反対側に3個)
+    // 実写準拠: 白いコアは持たず、彩度低めの半透明。最遠は中空のリング。
+    // サイズは明滅(I)に連動させず、光源がレンズ中心に近いほど
+    // 緩やかに小さくなる(輪郭の脈動もこれで消える)。
+    const distN = Math.min(1, dist / Math.hypot(cx, cy)); // 0=中心, 1=隅
+    const gBase = FLARE.baseSize * (0.80 + 0.35 * distN);
+    const [br, bg2, bb] = baseRGB.split(',').map(Number);
+    for(let i=0;i<GHOSTS.length;i++){
+      const G = GHOSTS[i];
+      const gx = cx - dx * G.k;
+      const gy = cy - dy * G.k;
+      const gSize = gBase * G.size;
+      const a = 0.22 * (ghostGain || 1) * I * G.a;
+      // コーティング色 70% + 光源色 30% の混合
+      const cr = Math.round(G.tint[0]*0.7 + br*0.3);
+      const cg = Math.round(G.tint[1]*0.7 + bg2*0.3);
+      const cb = Math.round(G.tint[2]*0.7 + bb*0.3);
+      const col = cr + ',' + cg + ',' + cb;
+      // 色収差: 内側は青寄り、外縁は赤(マゼンタ)寄りに強めにずらす
+      const colIn  = Math.round(cr*0.65) + ',' + Math.round(cg*0.90) + ',' + Math.min(255, Math.round(cb*1.35));
+      const colOut = Math.min(255, Math.round(cr*1.45)) + ',' + Math.round(cg*0.75) + ',' + Math.round(cb*0.90);
       const gg = gc.createRadialGradient(gx,gy,0, gx,gy,gSize);
-      gg.addColorStop(0.0, `rgba(255,255,255,${0.5*a})`);
-      gg.addColorStop(0.25,`rgba(${baseRGB},${0.7*a})`);
-      gg.addColorStop(1.0, `rgba(${baseRGB},0)`);
+      if (G.ring) {
+        // 中空リング: 内側も少し明るく(縁とのコントラスト弱め)。
+        // エッジはシャープに、縁の内外で色をずらす
+        gg.addColorStop(0.00, `rgba(${colIn},${0.10*a})`);
+        gg.addColorStop(0.70, `rgba(${colIn},${0.16*a})`);
+        gg.addColorStop(0.86, `rgba(${col},${0.42*a})`);
+        gg.addColorStop(0.95, `rgba(${colOut},${0.26*a})`);
+        gg.addColorStop(1.00, `rgba(${colOut},0)`);
+      } else {
+        // 円盤: 本体は均一、縁は狭い帯で色収差フリンジを付けてシャープに落とす
+        gg.addColorStop(0.00, `rgba(${col},${0.50*a})`);
+        gg.addColorStop(0.74, `rgba(${col},${0.46*a})`);
+        gg.addColorStop(0.90, `rgba(${colOut},${0.30*a})`);
+        gg.addColorStop(1.00, `rgba(${colOut},0)`);
+      }
       gc.fillStyle = gg; gc.beginPath(); gc.arc(gx,gy,gSize,0,Math.PI*2); gc.fill();
     }
 
@@ -710,7 +814,7 @@
 
         // 爆発コアに同色フレア（fx）
         const flareRGB = (e.type==='missile') ? palette.missile.line : palette.target.line;
-        drawLensFlare(fctx, p.x, p.y, Math.min(1.0, 0.9*u*(0.8+0.8*p.s)), now, flareRGB);
+        drawLensFlare(fctx, p.x, p.y, Math.min(1.0, 0.9*u*(0.8+0.8*p.s)), now, flareRGB, 1, true);
       }
       if(glowAlive){
         const u = 1 - (t/EXP_GLOW_LIFE);
@@ -721,7 +825,7 @@
         ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x,p.y, r,0,Math.PI*2); ctx.fill();
 
         const flareRGB = (e.type==='missile') ? palette.missile.line : palette.target.line;
-        drawLensFlare(fctx, p.x, p.y, 0.45*u*(0.8+0.6*p.s), now, flareRGB);
+        drawLensFlare(fctx, p.x, p.y, 0.45*u*(0.8+0.6*p.s), now, flareRGB, 1, true);
       }
     }
     for(let i=0;i<expl.length;){ if(now - expl[i].t0 > EXP_GLOW_LIFE) expl.splice(i,1); else i++; }
@@ -846,8 +950,9 @@
     if(tp.s>0){
       const scale = 1 + 1.2*tp.s;
       drawStarGlow(fctx, tp.x, tp.y, scale, 1.0, palette.target, 0.37, now);
+      // ターゲット: グロー+ストリークは描く。ハローなし・ゴースト極薄
       const flareIntensity = Math.min(1.0, 0.6 + 0.8*tp.s);
-      drawLensFlare(fctx, tp.x, tp.y, flareIntensity, now, palette.target.line);
+      drawLensFlare(fctx, tp.x, tp.y, flareIntensity, now, palette.target.line, 0.35, true);
     }
 
     // Missile
@@ -901,9 +1006,10 @@
         const scale2 = 1 + 1.2*pp.s;
         drawStarGlow(fctx, pp.x, pp.y, scale2, 1.0, palette.missile, (m.seed||0.12), now);
 
-        // Same-color flare for missile too
-        const flareI = Math.min(0.9, 0.45 + 0.7*pp.s);
-        drawLensFlare(fctx, pp.x, pp.y, flareI, now, palette.missile.line);
+        // ミサイル: グロー+ストリークは描く(強度は太陽より弱い光源として半分)。
+        // ハローなし・ゴースト極薄
+        const flareI = Math.min(0.45, 0.22 + 0.35*pp.s);
+        drawLensFlare(fctx, pp.x, pp.y, flareI, now, palette.missile.line, 0.35, true);
       }
 
       // Hit/behind/too far → set respawn delay, skip to next frame
@@ -924,6 +1030,29 @@
     const prev = ctx.globalCompositeOperation;
     ctx.globalCompositeOperation = 'lighter';
     ctx.drawImage(fx, 0, 0, W, H);
+
+    // 太陽(360度背景の光源)のレンズフレア: カメラ接続中のみ、全合成の
+    // 最前面に毎フレーム描画(蓄積なし)。位置は背景の太陽と厳密一致。
+    if (showBackground) {
+      const sunP = projectSunDir();
+      if (sunP) {
+        drawLensFlare(ctx, sunP.x, sunP.y, 1.0, now, '255,236,190', 4);
+        // 中心整列ブースト: 太陽がレンズ中心に近づくとベーリンググレア
+        // (画面全体を包む柔らかい白み)が立ち上がる。実写で太陽を正面に
+        // 入れたときのコントラスト低下の再現。
+        const dc = Math.hypot(sunP.x - W*0.5, sunP.y - H*0.5);
+        const align = Math.max(0, 1 - dc / (Math.hypot(W, H) * 0.25));
+        if (align > 0) {
+          const va = 0.28 * align * align * (0.8 + 0.2*Math.sin(now*1.5));
+          const vr = Math.hypot(W, H) * 0.7;
+          const vg = ctx.createRadialGradient(sunP.x, sunP.y, 0, sunP.x, sunP.y, vr);
+          vg.addColorStop(0.0, `rgba(255,240,215,${va})`);
+          vg.addColorStop(0.5, `rgba(255,240,215,${va*0.45})`);
+          vg.addColorStop(1.0, 'rgba(255,240,215,0)');
+          ctx.fillStyle = vg; ctx.beginPath(); ctx.arc(sunP.x, sunP.y, vr, 0, Math.PI*2); ctx.fill();
+        }
+      }
+    }
 
     ctx.globalCompositeOperation = prev;
 
