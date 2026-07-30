@@ -16,7 +16,7 @@
   'use strict';
 
   // デプロイごとに更新するバージョン(キャッシュバスティング/HUD表示用)
-  var ENH_VERSION = '20260717a';
+  var ENH_VERSION = '20260731b';
 
   if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
@@ -78,10 +78,16 @@
 
   var caption = document.createElement('div');
   caption.className = 'enh-missile-caption';
-  caption.innerHTML =
-    '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
-    '<p class="enh-cap-sub">マルチタスク対処方策の探求</p>' +
-    '<p class="enh-cap-text">画面クリックでドローンカメラに接続</p>';
+  function captionHTML(bottom) {
+    return '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
+      '<p class="enh-cap-sub">マルチタスク対処方策の探求</p>' +
+      '<p class="enh-cap-text">' + bottom + '</p>';
+  }
+  function updateCaption() {
+    caption.innerHTML = captionHTML(
+      dbg.bg ? 'ドローンカメラ接続中' : '画面クリックでドローンカメラに接続'
+    );
+  }
   sticky.appendChild(caption);
 
   /* ---------- ミサイル iframe(遅延挿入・常時操作ON) ---------- */
@@ -95,6 +101,7 @@
   // デバッグHUD: URL に ?debug=1 を付けると実機の内部状態を画面に表示する
   var DEBUG = /[?&]debug=1/.test(location.search);
   var dbg = { relay: 0, lastDy: 0, pS1: 0, mOp: 0, fw: 0, lt: 0, cap: false, wd: 0, bg: false, ifr: null };
+  updateCaption(); // 初期表示
   var hud = null;
   if (DEBUG) {
     hud = document.createElement('div');
@@ -224,13 +231,7 @@
     if (e.data.type === 'missileDebug') dbg.ifr = e.data;
     if (e.data.type === 'missileState') {
       dbg.bg = !!e.data.bg;
-      caption.innerHTML = dbg.bg
-        ? '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
-          '<p class="enh-cap-sub">マルチタスク対処方策の探求</p>' +
-          '<p class="enh-cap-text">ドローンカメラ接続中</p>'
-        : '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
-          '<p class="enh-cap-sub">マルチタスク対処方策の探求</p>' +
-          '<p class="enh-cap-text">画面クリックでドローンカメラに接続</p>';
+      updateCaption();
     }
   });
 
