@@ -16,7 +16,7 @@
   'use strict';
 
   // デプロイごとに更新するバージョン(キャッシュバスティング/HUD表示用)
-  var ENH_VERSION = '20260802a';
+  var ENH_VERSION = '20260804d';
 
   // ハンバーガーメニュー: 項目をタップしたら閉じる(CSSのチェックボックスを外す)。
   // 演出の有無に関係なく効かせたいので、reduced-motion の早期 return より前に置く
@@ -90,7 +90,7 @@
   caption.className = 'enh-missile-caption';
   function captionHTML(bottom) {
     return '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
-      '<p class="enh-cap-sub">マルチタスク対処方策の探求</p>' +
+      '<p class="enh-cap-sub">生物のマルチタスク対処能力の解明に向けて</p>' +
       '<p class="enh-cap-text">' + bottom + '</p>';
   }
   function updateCaption() {
@@ -110,7 +110,7 @@
 
   // デバッグHUD: URL に ?debug=1 を付けると実機の内部状態を画面に表示する
   var DEBUG = /[?&]debug=1/.test(location.search);
-  var dbg = { relay: 0, lastDy: 0, pS1: 0, mOp: 0, fw: 0, lt: 0, cap: false, wd: 0, bg: false, ifr: null };
+  var dbg = { relay: 0, lastDy: 0, pS1: 0, mOp: 0, fw: 0, fwX: 0, fwY: 0, lt: 0, cap: false, wd: 0, bg: false, ifr: null };
   updateCaption(); // 初期表示
   var hud = null;
   if (DEBUG) {
@@ -143,7 +143,8 @@
         ' pS1:' + dbg.pS1.toFixed(2) + ' mOp:' + dbg.mOp.toFixed(2) +
         ' PE:' + (missileFrame ? missileFrame.style.pointerEvents : '-') +
         '\n親: relay受信:' + dbg.relay + ' lastDy:' + dbg.lastDy +
-        ' 注入:' + dbg.fw + ' 層受信:' + dbg.lt + ' 捕捉:' + dbg.cap +
+        ' 注入:' + dbg.fw + ' fw座標:' + (dbg.fwX || 0) + ',' + (dbg.fwY || 0) +
+        ' 層受信:' + dbg.lt + ' 捕捉:' + dbg.cap +
         '\n診断: docH:' + Math.round(document.scrollingElement.scrollHeight) +
         ' iH:' + window.innerHeight +
         ' stageEnd:' + Math.round(stage.offsetTop + stage.offsetHeight) +
@@ -219,6 +220,37 @@
         gestureCapture = false;
         dbg.cap = false;
       }, { passive: true });
+    } else {
+      // PC もタッチと同じ「親で受けて注入」の一元アーキテクチャにする。
+      // iframe は常時 pointer-events:none(生成時のまま)でヒットテスト対象外。
+      // 実Safariは固定ナビの帯で iframe へのマウス配送を止める(親windowには
+      // 届くことをHUDで実測済み)ため、iframe 直接受信は使わず親経由に統一。
+      // capture:true は途中の stopPropagation に影響されないため。
+      var interactiveSel = 'a, label, input, button, .enh-debug-hud';
+      var onInteractive = function (e) {
+        return !!(e.target && e.target.closest && e.target.closest(interactiveSel));
+      };
+      var inject = function (fn, e) {
+        var w = missileFrame && missileFrame.contentWindow;
+        if (!w || !w.__missileInput) return;
+        var r = missileFrame.getBoundingClientRect();
+        var x = e.clientX - r.left, y = e.clientY - r.top;
+        w.__missileInput[fn](x, y);
+        dbg.fw++; dbg.fwX = Math.round(x); dbg.fwY = Math.round(y);
+      };
+      var forwardMove = function (e) {
+        if (dbg.mOp > 0.1) inject('move', e); // リンク上でも照準は追従させる
+      };
+      window.addEventListener('mousemove', forwardMove, true);
+      if (window.PointerEvent) window.addEventListener('pointermove', forwardMove, true);
+      // クリック=カメラ切替(タップ判定はiframe側の down/up ロジックを流用)。
+      // リンク等の操作要素上のクリックは切替に使わない。
+      window.addEventListener('mousedown', function (e) {
+        if (dbg.mOp > 0.1 && !onInteractive(e)) inject('down', e);
+      }, true);
+      window.addEventListener('mouseup', function (e) {
+        if (dbg.mOp > 0.1 && !onInteractive(e)) inject('up', e);
+      }, true);
     }
   }
 
@@ -310,11 +342,14 @@
     dbg.mOp = mOp;
     if (missileFrame) {
       missileFrame.style.opacity = mOp;
+      // 入力は PC/タッチとも親側で受けて注入するため、iframe の pointer-events
+      // は常時 none のまま(動的切替は Safari の PE キャッシュ問題も踏む)。
       if (!TOUCH_DEVICE) {
-        // PC: 従来どおり iframe を直接操作(表示中のみ)
-        missileFrame.style.pointerEvents = (mOp > 0.1) ? 'auto' : 'none';
+        // missile.html は cursor:none で自前照準を描く。iframe が非ヒットに
+        // なったぶん、演出中はステージ側でカーソルを消して挙動を引き継ぐ
+        // (ナビのリンクは別要素なので矢印カーソルのまま)。
+        sticky.style.cursor = (mOp > 0.1) ? 'none' : '';
       }
-      // タッチ端末はタッチ層が常時入力を受け、ジェスチャ単位で捕捉/素通しを判断
     }
     caption.style.opacity = mOp;
   }
@@ -337,6 +372,12 @@
   measure();
   // 画像読み込み完了でタイル寸法が変わるため再計測
   window.addEventListener('load', measure);
+  // loading="lazy" の画像・動画は load 後にも読み込まれてステージ高さを変える。
+  // geo が古いままだと pS1 の対応が狂い、ミサイル演出が「不可視+入力ゲート閉」
+  // で凍結する(読み込み順の競合で断続的に実発生)。寸法変化で自己修復する。
+  if (window.ResizeObserver) {
+    new ResizeObserver(function () { measure(); }).observe(stage);
+  }
 
   // 検証用フック(自動テストから同期的に再計算・再描画を呼ぶため)
   window.__enh = { measure: measure, geo: geo, onMissileScroll: onMissileScroll };
