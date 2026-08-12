@@ -16,7 +16,7 @@
   'use strict';
 
   // デプロイごとに更新するバージョン(キャッシュバスティング/HUD表示用)
-  var ENH_VERSION = '20260805a';
+  var ENH_VERSION = '20260813d';
 
   // ハンバーガーメニュー: 項目をタップしたら閉じる(CSSのチェックボックスを外す)。
   // 演出の有無に関係なく効かせたいので、reduced-motion の早期 return より前に置く
@@ -89,16 +89,59 @@
   var caption = document.createElement('div');
   caption.className = 'enh-missile-caption';
   function captionHTML(bottom) {
+    // ピクトグラム本体はキャプションの外(下の droneImg)。キャプションは
+    // opacity アニメ+z-index でスタッキングコンテキストを作るため、内側に
+    // 置くと mix-blend-mode が隔離されて背景と加算合成できない。ここには
+    // レイアウト維持用のスペーサーだけを置く。
     return '<p class="enh-cap-title">逃げる者と追う者の移動戦略</p>' +
       '<p class="enh-cap-sub">生物のマルチタスク対処能力の解明に向けて</p>' +
+      '<span class="enh-cap-drone-space"></span>' +
       '<p class="enh-cap-text">' + bottom + '</p>';
+  }
+  // 接続状態ピクトグラム: sticky 直下の独立 <img>(祖先に透明度アニメ要素を
+  // 持たせない)。要素自身の opacity / mix-blend-mode は隔離されず背景と合成される。
+  var droneImg = document.createElement('img');
+  droneImg.className = 'enh-cap-drone-layer';
+  droneImg.alt = '';
+  // 切替時のちらつき防止: 接続中版を先読みしておく
+  new Image().src = 'images/drone_connected.png?v=' + ENH_VERSION;
+  function positionDrone() {
+    var space = caption.querySelector('.enh-cap-drone-space');
+    if (!space) return;
+    var r = space.getBoundingClientRect();
+    var s = sticky.getBoundingClientRect();
+    droneImg.style.left = Math.round(r.left - s.left) + 'px';
+    droneImg.style.top = Math.round(r.top - s.top) + 'px';
+  }
+  // 接続中ピクトグラムは missile.html の canvas 内で screen 合成して描く
+  // (Safari は iframe 越しの mix-blend-mode を合成しないため)。
+  // スペーサーの位置・大きさ・透明度・状態を iframe へ同期する。
+  function syncBadge(mOp) {
+    var w = missileFrame && missileFrame.contentWindow;
+    if (!w || !w.__capBadge) return;
+    var space = caption.querySelector('.enh-cap-drone-space');
+    if (!space) return;
+    var r = space.getBoundingClientRect();
+    var f = missileFrame.getBoundingClientRect();
+    w.__capBadge(r.left - f.left, r.top - f.top, r.width, r.height, mOp, dbg.bg);
   }
   function updateCaption() {
     caption.innerHTML = captionHTML(
       dbg.bg ? 'ドローンカメラ接続中' : '画面クリックでドローンカメラに接続'
     );
+    if (dbg.bg) {
+      // 接続中: DOM側は隠し、canvas内の screen 合成描画に任せる
+      droneImg.style.visibility = 'hidden';
+    } else {
+      droneImg.src = 'images/drone_not_connected.png?v=' + ENH_VERSION;
+      droneImg.className = 'enh-cap-drone-layer enh-cap-drone--off';
+      droneImg.style.visibility = '';
+    }
+    positionDrone();
+    syncBadge(dbg.mOp);
   }
   sticky.appendChild(caption);
+  sticky.appendChild(droneImg);
 
   /* ---------- ミサイル iframe(遅延挿入・常時操作ON) ---------- */
 
@@ -295,6 +338,7 @@
     geo.heroRange = Math.max(1, s1.offsetTop - vh);
     geo.s1Range = Math.max(1, stage.offsetHeight - vh - geo.heroRange);
     render(true);
+    positionDrone(); // キャプション位置が変わりうるのでピクトグラム層も追随
   }
 
   function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
@@ -352,6 +396,8 @@
       }
     }
     caption.style.opacity = mOp;
+    droneImg.style.opacity = mOp;
+    syncBadge(mOp);
   }
 
   function onScroll() {
